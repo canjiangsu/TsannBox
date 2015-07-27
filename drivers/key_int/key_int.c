@@ -19,8 +19,14 @@
 #include <mach/regs-gpio.h>
 #include <mach/hardware.h>
 
-#define KEY_MAJOR	0
-#define DEVICE_NAME	"KEY_INT_DRIVER"
+#include "key_int.h"
+
+int key_major = 0;
+int key_minor = 0;
+
+module_param(key_major, int, S_IRUGO);
+
+#define DEVICE_NAME	"key_int"
 
 #define MAX_KEY_BUF	16
 #define KEY_NUM 4
@@ -32,6 +38,9 @@
 
 #define ISKEY_DOWN(key)	(!s3c2410_gpio_getpin(key_info_tab[key].gpio_port))
 
+MODULE_AUTHOR("Tsann");
+MODULE_LICENSE("Dual BSD/GPL");
+
 typedef unsigned char KEY_RET;
 
 typedef struct _KEY_DEV_{
@@ -41,10 +50,10 @@ typedef struct _KEY_DEV_{
 	unsigned int tail;
 	wait_queue_head_t wq;
 	struct cdev cdev;
+	struct timer_list timer[KEY_NUM];
 }KEY_DEV;
 
 static KEY_DEV keydev;
-static struct timer_list key_timer[KEY_NUM];
 
 struct key_info {
 	int irq_no;
@@ -64,8 +73,8 @@ static irqreturn_t s3c2410_eint_key(int irq, void *dev_id)
 	disable_irq(key_info_tab[key].irq_no);
 
 	keydev.keyStatus[key] = KEYSTATUS_INT;
-	key_timer[key].expires = jiffies+KEY_TIMER_DELAY;
-	add_timer(&key_timer[key]);
+	keydev.timer[key].expires = jiffies+KEY_TIMER_DELAY;
+	add_timer(&(keydev.timer[key]));
 	return IRQ_RETVAL(IRQ_HANDLED);
 }
 
@@ -95,25 +104,23 @@ static void free_irqs(void)
 */
 static void keyEvent(int key_no)
 {
-	keydev.buf[keydev.tail%MAX_KEY_BUF] = key_no;
+	keydev.buf[keydev.tail] = key_no;
 	keydev.tail ++;
-	keydev.tail = keydev.tail%MAX_KEY_BUF;
+	if (keydev.tail >= MAX_KEY_BUF)
+		keydev.tail = 0;
 	wake_up_interruptible(&(keydev.wq));
 	return;
 }
 static void key_timer_handler(unsigned long data)
 {
-	int key = data;
+	int key = (int)data;
 	if (ISKEY_DOWN(key)) {
 		if (keydev.keyStatus[key] == KEYSTATUS_INT) { //从中断进入
 			keydev.keyStatus[key] = KEYSTATUS_DOWN;
-			key_timer[key].expires = jiffies+KEY_TIMER_DELAY;
 			keyEvent(key_info_tab[key].key_no);	//记录键值，唤醒等待队列
-			add_timer(&key_timer[key]);
-		} else {
-			key_timer[key].expires = jiffies+KEY_TIMER_DELAY;
-			add_timer(&key_timer[key]);
 		}
+		keydev.timer[key].expires = jiffies+KEY_TIMER_DELAY;
+		add_timer(&(keydev.timer[key]));
 	} else {
 		keydev.keyStatus[key] = KEYSTATUS_UP;
 		enable_irq(key_info_tab[key].irq_no);
@@ -126,14 +133,17 @@ static int s3c2410_key_open(struct inode *inode, struct file *filp)
 	keydev.head = keydev.tail = 0;
 //	keyEvent = keyEvent_raw;
 
-	request_irqs(); //注册中断函数
 	keydev.head = keydev.tail = 0;
 	for (i=0; i<KEY_NUM; i++)
 		keydev.keyStatus[i] = KEYSTATUS_UP;
 	init_waitqueue_head(&(keydev.wq));
 
-	for (i=0; i<KEY_NUM; i++)
-		setup_timer(&key_timer[i], key_timer_handler, i);
+	for (i=0; i<KEY_NUM; i++) {
+		init_timer(&(keydev.timer[i]));
+		keydev.timer[i].function = key_timer_handler;
+		keydev.timer[i].data = (unsigned long)i;
+	}
+	request_irqs(); //注册中断函数
 	return 0;
 }
 static int s3c2410_key_release(struct inode *inode, struct file *filp)
@@ -142,9 +152,9 @@ static int s3c2410_key_release(struct inode *inode, struct file *filp)
 	int i;
 	
 	for (i = 0; i < KEY_NUM; i++) {
-		del_timer(&key_timer[i]);
+		del_timer(&(keydev.timer[i]));
 		disable_irq(key_info_tab[i].irq_no);
-		free_irq(key_info_tab[i].irq_no, s3c2410_eint_key);
+		free_irq(key_info_tab[i].irq_no, (void *)i);
 	}
 //	free_irqs();
 	return 0;
@@ -156,9 +166,10 @@ static KEY_RET keyRead(void)
 		printk(DEVICE_NAME " key buf is empty.\n");
 		return -1;
 	}
-	key_ret = keydev.buf[keydev.head%MAX_KEY_BUF];
+	key_ret = keydev.buf[keydev.head];
 	keydev.head ++;
-	keydev.head = keydev.head%MAX_KEY_BUF;
+	if (keydev.head >= MAX_KEY_BUF)
+		keydev.head = 0;
 	
 	return key_ret;
 }
@@ -176,7 +187,7 @@ retry:
 		if (filp->f_flags & O_NONBLOCK) {
 			return -EAGAIN;
 		}
-		interruptible_sleep_on(&(keydev.wq));
+		wait_event_interruptible(keydev.wq, (keydev.head != keydev.tail));
 		goto retry;
 	}
 	return err ? -EFAULT : 0;
@@ -189,24 +200,46 @@ static struct file_operations s3c2410_key_fops = {
 	.read = s3c2410_key_read,
 };
 
-static int __init s3c2410_key_init(void)
+int KeyInt_init(void)
 {
 	int iRet;
+	dev_t devno;
 
-	iRet = register_chrdev(KEY_MAJOR, DEVICE_NAME, &s3c2410_key_fops);
+	printk(KERN_ALERT "KeyInt_init: haha0!\n");
+
+	if (key_major) {
+		devno = MKDEV(key_major, key_minor);
+		iRet = register_chrdev_region(devno, 1, DEVICE_NAME);
+	} else {
+		iRet = alloc_chrdev_region(&devno, key_minor, 1, DEVICE_NAME);
+		key_major = MAJOR(devno);
+	}
+
 	if (iRet < 0) {
-		printk(DEVICE_NAME " can't register major number\n");
+		printk(KERN_WARNING "key_int: can't get major %d\n", key_major);
 		return iRet;
 	}
-	printk(DEVICE_NAME " initialized!\n");
+	cdev_init(&keydev.cdev, &s3c2410_key_fops);
+	keydev.cdev.owner = THIS_MODULE;
+	iRet = cdev_add(&keydev.cdev, devno, 1);
+
+	if (iRet) {
+		printk(KERN_NOTICE "Error %d adding key_int", iRet);
+		return iRet;
+	}
+
 	return 0;
 }
-static void __exit s3c2410_key_exit(void)
+void KeyInt_exit(void)
 {
-	unregister_chrdev(KEY_MAJOR, DEVICE_NAME);
-	printk(DEVICE_NAME " exit!\n");
+	dev_t devno = MKDEV(key_major, key_minor);
+
+	printk(KERN_ALERT "KeyInt exit!\n");
+	cdev_del(&keydev.cdev);
+	unregister_chrdev_region(devno, 1);
+
 }
 
-module_init(s3c2410_key_init);
-module_exit(s3c2410_key_exit);
+module_init(KeyInt_init);
+module_exit(KeyInt_exit);
 
